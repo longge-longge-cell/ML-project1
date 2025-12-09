@@ -1,0 +1,851 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import shap
+from sklearn import metrics
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (matthews_corrcoef, auc, roc_curve, classification_report,
+                             confusion_matrix, precision_recall_curve, cohen_kappa_score,
+                             precision_score, recall_score, f1_score, accuracy_score,
+                             roc_auc_score)
+from sklearn.preprocessing import LabelEncoder
+from sklearn.base import clone
+# Excel related libraries
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+##**************************************************************************************##
+##                     Core Fix: Resolve Missing Chinese Font and Tkinter Thread Issues ##
+##**************************************************************************************##
+plt.switch_backend('Agg')
+# Fix font missing issue, support English display (removed Chinese font config)
+plt.rcParams['axes.unicode_minus'] = False  # Fix minus sign display issue
+
+
+##**************************************************************************************##
+##                     New: Full Metric Calculation Function (Multi-class Compatible)   ##
+##**************************************************************************************##
+def calculate_multiclass_metrics_detail(y_true, y_pred, y_pred_prob, n_classes, label_mapping):
+    """Calculate full metrics for multi-class classification (overall + per-class)"""
+    # 1. Overall metrics
+    overall_acc = accuracy_score(y_true, y_pred)
+    kappa = cohen_kappa_score(y_true, y_pred)
+    mcc = matthews_corrcoef(y_true, y_pred)
+    macro_auc = roc_auc_score(y_true, y_pred_prob, multi_class='ovr', average='macro')
+    micro_auc = roc_auc_score(y_true, y_pred_prob, multi_class='ovr', average='micro')
+    macro_precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    macro_recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    macro_f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    weighted_precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    weighted_recall = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    weighted_f1 = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+
+    # 2. Per-class metrics (one-vs-rest strategy)
+    class_metrics = []
+    conf_mat = confusion_matrix(y_true, y_pred)
+    code2label = {v: k for k, v in label_mapping.items()}
+
+    for class_idx in range(n_classes):
+        TP = conf_mat[class_idx, class_idx]
+        FN = conf_mat[class_idx, :].sum() - TP
+        FP = conf_mat[:, class_idx].sum() - TP
+        TN = conf_mat.sum() - (TP + FN + FP)
+
+        precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+        recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+        specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        class_acc = (TP + TN) / (TP + TN + FP + FN) if (TP + TN + FP + FN) > 0 else 0.0
+
+        class_metrics.append({
+            'Class_Code': class_idx,
+            'Original_Label': code2label.get(class_idx, f'Class{class_idx}'),
+            'Precision': round(precision, 4),
+            'Recall(Sensitivity)': round(recall, 4),
+            'Specificity': round(specificity, 4),
+            'F1-Score': round(f1, 4),
+            'Class_Accuracy': round(class_acc, 4),
+            'TP': TP,
+            'TN': TN,
+            'FP': FP,
+            'FN': FN
+        })
+
+    # 3. Organize results
+    return {
+        'overall': {
+            'Overall_Accuracy': round(overall_acc, 4),
+            'Kappa_Coefficient': round(kappa, 4),
+            'MCC': round(mcc, 4),
+            'Macro-AUC': round(macro_auc, 4),
+            'Micro-AUC': round(micro_auc, 4),
+            'Macro-Precision': round(macro_precision, 4),
+            'Macro-Recall': round(macro_recall, 4),
+            'Macro-F1': round(macro_f1, 4),
+            'Weighted-Precision': round(weighted_precision, 4),
+            'Weighted-Recall': round(weighted_recall, 4),
+            'Weighted-F1': round(weighted_f1, 4)
+        },
+        'class_level': pd.DataFrame(class_metrics),
+        'confusion_matrix': conf_mat,
+        'label_mapping': label_mapping
+    }
+
+
+##**************************************************************************************##
+##                     New: Excel Report Generation Function (Multi-sheet)             ##
+##**************************************************************************************##
+def generate_metrics_excel(all_results, save_path, stage="Test"):
+    """Generate multi-sheet Excel metric report"""
+    wb = Workbook()
+    wb.remove(wb.active)  # Remove default worksheet
+
+    # Define styles
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    center_alignment = Alignment(horizontal="center", vertical="center")
+
+    # 1. Worksheet 1: Overall metrics summary for all models
+    ws1 = wb.create_sheet(title=f"{stage}_Overall_Metrics_Summary")
+    overall_headers = ["Model_Name"] + list(next(iter(all_results.values()))['overall'].keys())
+    for col, header in enumerate(overall_headers, 1):
+        cell = ws1.cell(row=1, column=col, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_alignment
+    # Fill data
+    for row, (model_name, metrics) in enumerate(all_results.items(), 2):
+        ws1.cell(row=row, column=1, value=model_name).alignment = center_alignment
+        for col, (metric_key, metric_val) in enumerate(metrics['overall'].items(), 2):
+            ws1.cell(row=row, column=col, value=metric_val).alignment = center_alignment
+    # Adjust column width
+    for col in range(1, len(overall_headers) + 1):
+        ws1.column_dimensions[chr(64 + col)].width = 22
+
+    # 2. Separate worksheet for each model (per-class metrics + confusion matrix)
+    for model_name, metrics in all_results.items():
+        ws_model = wb.create_sheet(title=f"{stage}_{model_name}")
+
+        # 2.1 Per-class metrics
+        class_df = metrics['class_level']
+        class_headers = list(class_df.columns)
+        for col, header in enumerate(class_headers, 1):
+            cell = ws_model.cell(row=1, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_alignment
+        # Fill per-class data
+        for row, (_, row_data) in enumerate(class_df.iterrows(), 2):
+            for col, val in enumerate(row_data, 1):
+                ws_model.cell(row=row, column=col, value=val).alignment = center_alignment
+
+        # 2.2 Confusion matrix (start from column 12)
+        conf_mat = metrics['confusion_matrix']
+        n_classes = conf_mat.shape[0]
+        code2label = {v: k for k, v in metrics['label_mapping'].items()}
+        # Confusion matrix title
+        ws_model.cell(row=1, column=12, value=f"{model_name} Confusion Matrix (Row=True, Column=Predicted)").font = Font(bold=True)
+        ws_model.merge_cells(start_row=1, start_column=12, end_row=1, end_column=12 + n_classes)
+        # Confusion matrix header (predicted classes)
+        ws_model.cell(row=2, column=12, value="True\\Predicted").font = header_font
+        ws_model.cell(row=2, column=12).fill = header_fill
+        ws_model.cell(row=2, column=12).alignment = center_alignment
+        for col, class_idx in enumerate(range(n_classes), 13):
+            cell = ws_model.cell(row=2, column=col,
+                                 value=f"Pred_{class_idx}\n({code2label.get(class_idx, f'Class{class_idx}')})")
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_alignment
+        # Confusion matrix data (true classes + values)
+        for row, true_class in enumerate(range(n_classes), 3):
+            ws_model.cell(row=row, column=12,
+                          value=f"True_{true_class}\n({code2label.get(true_class, f'Class{true_class}')})")
+            ws_model.cell(row=row, column=12).font = header_font
+            ws_model.cell(row=row, column=12).fill = header_fill
+            ws_model.cell(row=row, column=12).alignment = center_alignment
+            # Fill values
+            for col, pred_class in enumerate(range(n_classes), 13):
+                val = conf_mat[true_class, pred_class]
+                cell = ws_model.cell(row=row, column=col, value=val)
+                cell.alignment = center_alignment
+                if true_class == pred_class:
+                    cell.fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+        # Adjust column width
+        for col in range(1, 12):
+            ws_model.column_dimensions[chr(64 + col)].width = 20
+        for col in range(12, 12 + n_classes + 1):
+            ws_model.column_dimensions[chr(64 + col)].width = 15
+
+    # 3. Worksheet n+1: Metric explanations
+    ws_explain = wb.create_sheet(title="Metric_Explanations")
+    explain_texts = [
+        "1. Overall Metrics Explanation:",
+        "   - Overall_Accuracy: Proportion of correctly predicted samples",
+        "   - Kappa_Coefficient: Classification consistency excluding random guess (0=no consistency, 1=perfect consistency)",
+        "   - MCC: Balanced consistency metric for imbalanced classes (-1=perfect inconsistency, 1=perfect consistency)",
+        "   - Macro-AUC: Arithmetic mean of per-class AUC (balanced class weights)",
+        "   - Micro-AUC: AUC calculated from all samples' TPR/FPR (reflects sample distribution)",
+        "   - Macro-*/Weighted-*: Macro average (equal class weight)/Weighted average (weighted by sample count)",
+        "",
+        "2. Per-class Metrics Explanation (One-vs-Rest, current class as positive):",
+        "   - Precision: Proportion of predicted positive samples that are actually positive",
+        "   - Recall(Sensitivity): Proportion of actual positive samples correctly predicted",
+        "   - Specificity: Proportion of actual negative samples correctly predicted",
+        "   - F1-Score: Harmonic mean of Precision and Recall (balances both)",
+        "   - TP/TN/FP/FN: Basic confusion matrix elements (True Positive/True Negative/False Positive/False Negative)",
+        "",
+        "3. Confusion Matrix Explanation:",
+        "   - Rows: True classes, Columns: Predicted classes",
+        "   - Diagonal elements: Correct predictions (highlighted in yellow)",
+        "   - Off-diagonal elements: Incorrect predictions"
+    ]
+    for row, text in enumerate(explain_texts, 1):
+        ws_explain.cell(row=row, column=1, value=text).alignment = Alignment(horizontal="left", vertical="center")
+        ws_explain.column_dimensions['A'].width = 80
+
+    # Save Excel
+    try:
+        wb.save(save_path)
+        print(f"✅ {stage} stage Excel metric report saved: {os.path.basename(save_path)}")
+    except Exception as e:
+        raise RuntimeError(f"❌ Failed to save Excel: {str(e)}")
+
+
+##**************************************************************************************##
+##                     Enhanced: SHAP Analysis Function (Fixed All Known Issues)        ##
+##**************************************************************************************##
+def shap_analysis_tree(model, model_name, X_data, y_true, feature_names, label_encoder, output_dir):
+    """SHAP analysis for tree-based models (RandomForest): Enhanced force plot feature display"""
+    n_classes = len(label_encoder.classes_)
+    all_mean_abs_shap = []
+
+    # Create subdirectories for different SHAP plots
+    shap_dirs = ["shap_summary", "shap_force", "shap_waterfall", "shap_dependence", "shap_beeswarm"]
+    for dir_name in shap_dirs:
+        os.makedirs(os.path.join(output_dir, dir_name), exist_ok=True)
+
+    print(f"📌 {model_name} (Tree Model): Starting SHAP analysis for {n_classes} classes")
+    try:
+        explainer = shap.TreeExplainer(model, model_output="raw")
+        shap_values = explainer.shap_values(X_data)
+        print(f"✅ Successfully calculated SHAP values, shape: {np.array(shap_values).shape}")
+    except Exception as e:
+        print(f"❌ Failed to calculate SHAP values: {str(e)}")
+        return
+
+    # Analyze each class
+    for class_idx in range(n_classes):
+        current_class_name = label_encoder.classes_[class_idx]
+        print(f"🔍 Processing SHAP analysis for class {class_idx} ({current_class_name})")
+
+        # Process SHAP values (keep original logic)
+        try:
+            if isinstance(shap_values, list) and len(shap_values) == n_classes:
+                sv = shap_values[class_idx]
+            elif len(shap_values.shape) == 3:
+                print(f"ℹ️ {model_name} class {class_idx} detected 3D SHAP values {shap_values.shape}, extracting current class data")
+                sv = shap_values[:, :, class_idx]  # Multi-class: get current class
+            elif isinstance(shap_values, list) and len(shap_values) == 2:
+                print(f"ℹ️ {model_name} class {class_idx} detected binary classification SHAP value list, extracting positive class data")
+                sv = shap_values[1]  # Binary: get positive class
+            else:
+                sv = shap_values
+
+            # Ensure 2D array
+            sv = np.squeeze(sv)
+            if len(sv.shape) != 2:
+                print(f"⚠️ Abnormal SHAP value shape {sv.shape} for class {class_idx}, skipping")
+                continue
+            if sv.shape[1] != len(feature_names):
+                print(f"⚠️ Feature count mismatch for class {class_idx}: SHAP={sv.shape[1]}, Features={len(feature_names)}, skipping")
+                continue
+        except Exception as e:
+            print(f"⚠️ Failed to process SHAP values for class {class_idx}: {str(e)}, skipping")
+            continue
+
+        # Calculate feature importance (keep original logic)
+        mean_abs_shap = np.mean(np.abs(sv), axis=0)
+        mean_abs_shap = np.squeeze(mean_abs_shap)
+        all_mean_abs_shap.append(mean_abs_shap)
+
+        # 5. Local explanation - Improved force plot generation (fixed feature display issue)
+        try:
+            # Predict probabilities (keep original logic)
+            y_pred_prob = model.predict_proba(X_data)
+            y_pred = model.predict(X_data)
+            class_prob = y_pred_prob[:, class_idx]
+            print(f"✅ Successfully obtained prediction probabilities, shape: {y_pred_prob.shape}")
+        except Exception as e:
+            print(f"❌ Failed to get prediction probabilities: {str(e)}, cannot generate local explanation plots")
+            continue
+
+        # Select samples (keep original logic)
+        try:
+            # Ensure sufficient samples
+            sample_indices = list(np.random.choice(range(len(X_data)), min(3, len(X_data)), replace=False))
+            print(f"📊 Selected {len(sample_indices)} samples for local explanation")
+        except Exception as e:
+            print(f"❌ Failed to select samples: {str(e)}, using random samples")
+            sample_indices = list(np.random.choice(range(len(X_data)), min(3, len(X_data)), replace=False))
+
+        # Generate force plots and waterfall plots for selected samples
+        if len(sample_indices) > 0:
+            for sample_idx in sample_indices:
+                try:
+                    # Get sample basic info (keep original logic)
+                    pred_class = y_pred[sample_idx]
+                    pred_prob = y_pred_prob[sample_idx][class_idx]
+                    max_prob = np.max(y_pred_prob[sample_idx])
+                    max_class = np.argmax(y_pred_prob[sample_idx])
+
+                    # Process base value (keep original logic)
+                    try:
+                        if isinstance(explainer.expected_value, (list, np.ndarray)):
+                            base_value = explainer.expected_value[class_idx] if class_idx < len(
+                                explainer.expected_value) else np.mean(explainer.expected_value)
+                        else:
+                            base_value = explainer.expected_value
+                        base_value = base_value.item() if isinstance(base_value, np.ndarray) else base_value
+                    except:
+                        base_value = 0.0
+
+                    # Generate force plot (improved feature display)
+                    try:
+                        # 1. Feature name processing: shorten long feature names for complete display
+                        short_feature_names = []
+                        for name in feature_names:
+                            # Truncate feature names longer than 20 characters
+                            if len(name) > 20:
+                                short_feature_names.append(f"{name[:17]}...")
+                            else:
+                                short_feature_names.append(name)
+
+                        # 2. Select top 15 features with largest impact on prediction to avoid overcrowding
+                        sample_shap_values = sv[sample_idx]
+                        top_feature_indices = np.argsort(np.abs(sample_shap_values))[::-1][:15]
+                        top_feature_names = [short_feature_names[i] for i in top_feature_indices]
+                        top_shap_values = sample_shap_values[top_feature_indices]
+                        top_X_values = X_data[sample_idx][top_feature_indices]
+
+                        # 3. Generate force plot with optimized display parameters
+                        is_extreme = max_prob > 0.95
+
+                        # Use wider canvas to display more features
+                        shap_plot = shap.force_plot(
+                            base_value,
+                            top_shap_values,
+                            top_X_values,
+                            feature_names=top_feature_names,
+                            matplotlib=True,
+                            show=False,
+                            figsize=(16, 6),  # Wider canvas
+                            text_rotation=15  # Rotate feature names by 15 degrees to reduce overlap
+                        )
+
+                        # Manually set x-axis range for extreme predictions
+                        if is_extreme:
+                            plt.xlim(-0.8, 0.8)
+
+                        # Get true label and set title
+                        true_class = y_true[sample_idx] if sample_idx < len(y_true) else "Unknown"
+                        true_class_name = label_encoder.classes_[true_class] if true_class < len(
+                            label_encoder.classes_) else "Unknown"
+
+                        plt.title(
+                            f'{model_name} Force Plot - Sample{sample_idx} (Class: {current_class_name})\n'
+                            f'True: {true_class_name} | Predicted: {label_encoder.classes_[pred_class]} | Probability: {max_prob:.3f}',
+                            fontsize=10
+                        )
+
+                        # Save force plot
+                        force_path = os.path.join(output_dir, "shap_force",
+                                                  f"SHAP_{model_name}_Class{class_idx}_{current_class_name}_Force_Sample{sample_idx}.pdf")
+                        plt.savefig(force_path, dpi=300, bbox_inches='tight')
+                        plt.close()
+                        print(f"✅ Saved force plot for sample {sample_idx}")
+                    except Exception as e:
+                        print(f"❌ Failed to generate force plot for sample {sample_idx}: {str(e)}")
+
+                except Exception as e:
+                    print(f"❌ Error processing sample {sample_idx}: {str(e)}")
+
+    print(f"✅ {model_name} SHAP analysis completed, generated global and local explanation plots")
+
+
+##**************************************************************************************##
+##                     Step1. Configure Absolute Paths (Modify According to Actual File)##
+##**************************************************************************************##
+SNP_FEATURE_PATH = r"D:\ML\try5\after.tsv"
+HOST_LABEL_PATH = r"D:\ML\try5\host.xlsx"
+OUTPUT_DIR = r"D:\ML\try5\output_results9"  # Final results directory
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+##**************************************************************************************##
+##                     Step2. Load and Preprocess Data (Enhanced Robustness Check)      ##
+##**************************************************************************************##
+# Load SNP data
+try:
+    snp_data = pd.read_csv(SNP_FEATURE_PATH, sep='\t', index_col=0)
+    if snp_data.empty:
+        raise ValueError("SNP feature file is empty, check file integrity")
+    print(f"✅ Loaded SNP data: shape {snp_data.shape} (SNP sites × strains)")
+except Exception as e:
+    raise RuntimeError(f"❌ Failed to load SNP file: {str(e)} (Check path correctness)")
+
+# Load host data
+try:
+    host_data = pd.read_excel(HOST_LABEL_PATH)
+    if host_data.empty:
+        raise ValueError("Host label file is empty, check file integrity")
+    print(f"✅ Loaded host data: shape {host_data.shape} (strains × 2 columns)")
+except Exception as e:
+    raise RuntimeError(f"❌ Failed to load host file: {str(e)} (Check path correctness)")
+
+# Strain matching and data alignment
+strain_id_col = host_data.columns[0]
+host_label_col = host_data.columns[1]
+print(f"🔍 Strain ID column: {strain_id_col}, Host label column: {host_label_col}")
+
+snp_transposed = snp_data.transpose()
+print(f"🔄 Transposed SNP data: shape {snp_transposed.shape} (strains × SNP sites)")
+
+snp_strains = set(snp_transposed.index.astype(str))
+host_strains = set(host_data[strain_id_col].astype(str))
+common_strains = list(snp_strains & host_strains)
+
+if len(common_strains) == 0:
+    raise ValueError("❌ No matching strain IDs found! Check strain ID format (e.g., case, spaces) in both files")
+print(f"✅ Matched {len(common_strains)} common strains (used for subsequent modeling)")
+
+# Filter and align data
+snp_filtered = snp_transposed.loc[common_strains].sort_index()
+host_filtered = host_data[host_data[strain_id_col].astype(str).isin(common_strains)]
+host_filtered = host_filtered.set_index(strain_id_col).reindex(snp_filtered.index).reset_index()
+
+# Check for missing labels
+if host_filtered[host_label_col].isnull().any():
+    missing_strains = host_filtered[host_filtered[host_label_col].isnull()][strain_id_col].tolist()
+    raise ValueError(f"❌ Missing host labels for the following strains: {missing_strains}, check host file")
+
+if len(snp_filtered) != len(host_filtered):
+    raise ValueError(f"❌ Feature and label count mismatch: Features {len(snp_filtered)}, Labels {len(host_filtered)}")
+
+# Label encoding and class check
+label_encoder = LabelEncoder()
+host_labels = label_encoder.fit_transform(host_filtered[host_label_col])
+n_classes = len(np.unique(host_labels))
+label_mapping = dict(zip(label_encoder.classes_, range(n_classes)))
+print(f"🏷️  Host class mapping (total {n_classes} classes): {label_mapping}")
+
+# Check class sample counts (avoid overfitting for minority classes)
+class_counts = np.bincount(host_labels)
+min_class_count = min(class_counts)
+if min_class_count < 3:
+    minor_class_idx = np.where(class_counts == min_class_count)[0][0]
+    minor_class_name = label_encoder.classes_[minor_class_idx]
+    raise ValueError(f"❌ Class {minor_class_name} has only {min_class_count} samples (less than 3), cannot train effectively")
+print(f"📊 Class sample distribution: {dict(zip(label_encoder.classes_, class_counts))}")
+
+# Data splitting
+X = snp_filtered.values
+y = host_labels
+feature_names = snp_filtered.columns.tolist()  # Save SNP site names (for SHAP)
+if len(X) < 10:
+    raise ValueError(f"❌ Insufficient total samples (only {len(X)}), cannot split into 80/20 train/test sets")
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=123
+)
+print(f"📊 Data splitting completed:")
+print(f"  - Training set: {X_train.shape} (samples × SNP sites), label distribution {dict(zip(label_encoder.classes_, np.bincount(y_train)))}")
+print(f"  - Test set: {X_test.shape} (samples × SNP sites), label distribution {dict(zip(label_encoder.classes_, np.bincount(y_test)))}")
+
+##**************************************************************************************##
+##                     Step3. Initialize RandomForest Model and Cross-Validation       ##
+##**************************************************************************************##
+# Keep only RandomForest model
+models = {
+    "RandomForest": RandomForestClassifier(n_estimators=200, random_state=0, n_jobs=-1)  # Multi-thread acceleration
+}
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=123)
+cv_results = {
+    model_name: {
+        "tprs": [[] for _ in range(n_classes)],
+        "roc_aucs": [[] for _ in range(n_classes)],
+        "final_model": None,  # Final model (trained on full training set)
+        "cv_fold_metrics": []  # Metrics for each fold
+    } for model_name in models.keys()
+}
+mean_fpr = np.linspace(0, 1, 100)
+
+print(f"\n🚀 Starting 5-fold cross-validation training (Models: {', '.join(models.keys())})")
+for model_name, model in models.items():
+    print(f"\n--- Training: {model_name} ---")
+    for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train), 1):
+        print(f"  Training fold {fold_idx}/{cv.get_n_splits()}...")  # Progress hint
+        X_cv_train, X_cv_val = X_train[train_idx], X_train[val_idx]
+        y_cv_train, y_cv_val = y_train[train_idx], y_train[val_idx]
+
+        # Use cloned model to avoid overwriting original model
+        fold_model = clone(model)
+        fold_model.fit(X_cv_train, y_cv_train)
+
+        # Prediction and metric calculation
+        y_cv_pred = fold_model.predict(X_cv_val)
+        y_cv_prob = fold_model.predict_proba(X_cv_val)
+
+        # Calculate full metrics for current fold
+        fold_metrics = calculate_multiclass_metrics_detail(
+            y_true=y_cv_val,
+            y_pred=y_cv_pred,
+            y_pred_prob=y_cv_prob,
+            n_classes=n_classes,
+            label_mapping=label_mapping
+        )
+        cv_results[model_name]["cv_fold_metrics"].append(fold_metrics)
+
+        # ROC curve data
+        for class_idx in range(n_classes):
+            fpr, tpr, _ = roc_curve(y_cv_val, y_cv_prob[:, class_idx], pos_label=class_idx)
+            interp_tpr = np.interp(mean_fpr, fpr, tpr)
+            interp_tpr[0] = 0.0
+            cv_results[model_name]["tprs"][class_idx].append(interp_tpr)
+            cv_results[model_name]["roc_aucs"][class_idx].append(auc(fpr, tpr))
+
+    # Train final model on full training set
+    final_model = clone(model)
+    final_model.fit(X_train, y_train)
+    cv_results[model_name]["final_model"] = final_model
+    print(f"✅ {model_name} cross-validation completed (total {len(cv_results[model_name]['cv_fold_metrics'])} folds)")
+
+##**************************************************************************************##
+##                     Step3.1 Calculate Cross-Validation Metrics and Save to Excel     ##
+##**************************************************************************************##
+cv_all_models_metrics = {}
+for model_name, model_info in cv_results.items():
+    fold_metrics_list = model_info["cv_fold_metrics"]
+    n_folds = len(fold_metrics_list)
+
+    # 1. Average overall metrics
+    avg_overall = {}
+    for metric_key in fold_metrics_list[0]['overall'].keys():
+        metric_values = [fold['overall'][metric_key] for fold in fold_metrics_list]
+        avg_overall[metric_key] = round(np.mean(metric_values), 4)
+
+    # 2. Average per-class metrics (sum TP/TN/FP/FN)
+    avg_class_df = fold_metrics_list[0]['class_level'].copy()
+    sum_cols = ['TP', 'TN', 'FP', 'FN']
+    for col in sum_cols:
+        arrays = np.array([fold['class_level'][col].values for fold in fold_metrics_list])
+        avg_class_df[col] = np.sum(arrays, axis=0)
+    # Average other metrics
+    avg_cols = [col for col in avg_class_df.columns if col not in ['Class_Code', 'Original_Label'] + sum_cols]
+    for col in avg_cols:
+        col_values = [fold['class_level'][col].values for fold in fold_metrics_list]
+        avg_class_df[col] = np.round(np.mean(col_values, axis=0), 4)
+
+    # 3. Sum confusion matrices
+    avg_conf_mat = sum([fold['confusion_matrix'] for fold in fold_metrics_list])
+
+    cv_all_models_metrics[model_name] = {
+        'overall': avg_overall,
+        'class_level': avg_class_df,
+        'confusion_matrix': avg_conf_mat,
+        'label_mapping': label_mapping
+    }
+
+# Generate cross-validation Excel report
+cv_excel_path = os.path.join(OUTPUT_DIR, "CV_Full_Metrics_Report.xlsx")
+generate_metrics_excel(
+    all_results=cv_all_models_metrics,
+    save_path=cv_excel_path,
+    stage="CV"
+)
+
+##**************************************************************************************##
+##                     Step4. Save Basic Cross-Validation Metrics                      ##
+##**************************************************************************************##
+cv_metrics = []
+cv_reports = []
+for model_name, model_metrics in cv_all_models_metrics.items():
+    cv_metrics.append(model_metrics['overall']['MCC'])
+    # Generate classification report
+    class_report = f"=== {model_name} Cross-Validation Average Classification Report ===\n"
+    class_df = model_metrics['class_level']
+    for _, row in class_df.iterrows():
+        class_report += (f"Class{row['Class_Code']} ({row['Original_Label']}): "
+                         f"Precision={row['Precision']}, "
+                         f"Recall={row['Recall(Sensitivity)']}, "
+                         f"F1={row['F1-Score']}\n")
+    class_report += f"Overall Accuracy: {model_metrics['overall']['Overall_Accuracy']}, "
+    class_report += f"MCC: {model_metrics['overall']['MCC']}\n"
+    cv_reports.append(class_report)
+
+# Save MCC and classification report
+mcc_df = pd.DataFrame({
+    "Model": list(models.keys()),
+    "CV_Average_MCC": cv_metrics
+})
+mcc_df.to_csv(os.path.join(OUTPUT_DIR, "Train_CV_MCC.csv"), index=False, encoding='utf-8')
+
+with open(os.path.join(OUTPUT_DIR, "Train_CV_Classification_Report.txt"), "w", encoding='utf-8') as f:
+    f.write("=" * 60 + " Cross-Validation Average Classification Report " + "=" * 60 + "\n\n")
+    for i, model_name in enumerate(models.keys()):
+        f.write(cv_reports[i] + "\n")
+        f.write("-" * 120 + "\n\n")
+
+print(f"\n📁 Saved basic cross-validation metrics:")
+print(f"  - Train_CV_MCC.csv: Cross-validation average MCC for RandomForest model")
+print(f"  - Train_CV_Classification_Report.txt: Cross-validation average classification report for RandomForest model")
+
+
+##**************************************************************************************##
+##                     Step5. Plot Cross-Validation ROC Curves                         ##
+##**************************************************************************************##
+def plot_cv_roc(model_name, tprs, roc_aucs, n_classes, mean_fpr, save_path):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    class_names = label_encoder.classes_
+
+    for class_idx in range(n_classes):
+        mean_tpr = np.mean(tprs[class_idx], axis=0)
+        mean_tpr[-1] = 1.0
+        mean_auc = auc(mean_fpr, mean_tpr)
+        std_auc = np.std(roc_aucs[class_idx])
+        std_tpr = np.std(tprs[class_idx], axis=0)
+
+        ax.plot(mean_fpr, mean_tpr, color=colors[class_idx],
+                label=f'{class_names[class_idx]} (AUC={mean_auc:.3f}±{std_auc:.2f})',
+                lw=2, alpha=0.8)
+        tpr_upper = np.minimum(mean_tpr + std_tpr, 1)
+        tpr_lower = np.maximum(mean_tpr - std_tpr, 0)
+        ax.fill_between(mean_fpr, tpr_lower, tpr_upper,
+                        color=colors[class_idx], alpha=0.2, label='_nolegend_')
+
+    ax.plot([0, 1], [0, 1], '--', color='gray', alpha=0.8, lw=2, label='Random Guess')
+    ax.set_xlim([-0.05, 1.05])
+    ax.set_ylim([-0.05, 1.05])
+    ax.set_xlabel('False Positive Rate', fontsize=10)
+    ax.set_ylabel('True Positive Rate', fontsize=10)
+    ax.set_title(f'{model_name} 5-Fold Cross-Validation Multi-Class ROC Curve', fontsize=12, pad=15)
+    ax.legend(loc='lower right', fontsize=8)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+for model_name in models.keys():
+    save_path = os.path.join(OUTPUT_DIR, f"Train_CV_{model_name}_ROC.pdf")
+    plot_cv_roc(
+        model_name=model_name,
+        tprs=cv_results[model_name]["tprs"],
+        roc_aucs=cv_results[model_name]["roc_aucs"],
+        n_classes=n_classes,
+        mean_fpr=mean_fpr,
+        save_path=save_path
+    )
+    print(f"✅ Cross-validation ROC curve saved: {os.path.basename(save_path)}")
+
+##**************************************************************************************##
+##                     Step6. Test Set Evaluation (Final Model Generalization)         ##
+##**************************************************************************************##
+test_all_models_metrics = {}
+test_metrics = {
+    "Model": [],
+    "MCC": [],
+    "Overall_AUC": [],
+    "Classification_Report": []
+}
+
+
+def plot_test_roc(model_name, y_true, y_pred_prob, n_classes, save_path):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    class_names = label_encoder.classes_
+    class_aucs = []
+
+    for class_idx in range(n_classes):
+        fpr, tpr, _ = roc_curve(y_true, y_pred_prob[:, class_idx], pos_label=class_idx)
+        auc_val = auc(fpr, tpr)
+        class_aucs.append(auc_val)
+        ax.plot(fpr, tpr, color=colors[class_idx],
+                label=f'{class_names[class_idx]} (AUC={auc_val:.3f})', lw=2)
+
+    ax.plot([0, 1], [0, 1], '--', color='gray', alpha=0.8, lw=2, label='Random Guess')
+    ax.set_xlabel('False Positive Rate', fontsize=10)
+    ax.set_ylabel('True Positive Rate', fontsize=10)
+    ax.set_title(f'{model_name} Test Set Multi-Class ROC Curve', fontsize=12)
+    ax.legend(loc='lower right', fontsize=8)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    return np.mean(class_aucs)
+
+
+def plot_test_pr(model_name, y_true, y_pred_prob, n_classes, save_path):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    class_names = label_encoder.classes_
+
+    for class_idx in range(n_classes):
+        precision, recall, _ = precision_recall_curve(
+            y_true, y_pred_prob[:, class_idx], pos_label=class_idx
+        )
+        pr_auc = auc(recall, precision)
+        ax.plot(recall, precision, color=colors[class_idx],
+                label=f'{class_names[class_idx]} (AUCPR={pr_auc:.3f})', lw=2)
+
+    ax.set_xlabel('Recall', fontsize=10)
+    ax.set_ylabel('Precision', fontsize=10)
+    ax.set_title(f'{model_name} Test Set Multi-Class PR Curve', fontsize=12)
+    ax.legend(loc='lower left', fontsize=8)
+    ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+# Test set evaluation
+print(f"\n📊 Starting test set evaluation (validate model generalization)")
+for model_name in models.keys():
+    model = cv_results[model_name]["final_model"]
+    y_test_pred = model.predict(X_test)
+    y_test_prob = model.predict_proba(X_test)
+
+    # Calculate full test set metrics
+    test_model_metrics = calculate_multiclass_metrics_detail(
+        y_true=y_test,
+        y_pred=y_test_pred,
+        y_pred_prob=y_test_prob,
+        n_classes=n_classes,
+        label_mapping=label_mapping
+    )
+    test_all_models_metrics[model_name] = test_model_metrics
+
+    # Convert target_names to string list
+    mcc = test_model_metrics['overall']['MCC']
+    report = classification_report(
+        y_test,
+        y_test_pred,
+        target_names=[str(cls) for cls in label_encoder.classes_]
+    )
+    overall_auc = plot_test_roc(
+        model_name=model_name,
+        y_true=y_test,
+        y_pred_prob=y_test_prob,
+        n_classes=n_classes,
+        save_path=os.path.join(OUTPUT_DIR, f"Test_{model_name}_ROC.pdf")
+    )
+
+    plot_test_pr(
+        model_name=model_name,
+        y_true=y_test,
+        y_pred_prob=y_test_prob,
+        n_classes=n_classes,
+        save_path=os.path.join(OUTPUT_DIR, f"Test_{model_name}_PR.pdf")
+    )
+
+    test_metrics["Model"].append(model_name)
+    test_metrics["MCC"].append(mcc)
+    test_metrics["Overall_AUC"].append(overall_auc)
+    test_metrics["Classification_Report"].append(report)
+
+    print(f"✅ {model_name} test set evaluation completed: MCC={mcc:.4f}, average AUC={overall_auc:.3f}")
+
+##**************************************************************************************##
+##                     Step6.1 Save Test Set Full Metrics to Excel                     ##
+##**************************************************************************************##
+test_excel_path = os.path.join(OUTPUT_DIR, "Test_Full_Metrics_Report.xlsx")
+generate_metrics_excel(
+    all_results=test_all_models_metrics,
+    save_path=test_excel_path,
+    stage="Test"
+)
+
+##**************************************************************************************##
+##                     Step7. Save Basic Test Set Results                              ##
+##**************************************************************************************##
+# Save basic metrics
+test_metrics_df = pd.DataFrame({
+    "Model": test_metrics["Model"],
+    "Test_MCC": test_metrics["MCC"],
+    "Test_Average_AUC": [round(auc, 4) for auc in test_metrics["Overall_AUC"]]
+})
+test_metrics_df.to_csv(os.path.join(OUTPUT_DIR, "Test_Metrics.csv"), index=False, encoding='utf-8')
+
+# Save classification report (with original class names)
+with open(os.path.join(OUTPUT_DIR, "Test_Classification_Report.txt"), "w", encoding='utf-8') as f:
+    f.write("=" * 60 + " Test Set Classification Report " + "=" * 60 + "\n\n")
+    for i, model_name in enumerate(test_metrics["Model"]):
+        f.write(f"=== {model_name} ===\n")
+        f.write(test_metrics["Classification_Report"][i] + "\n")
+        f.write("-" * 120 + "\n\n")
+
+# Save confusion matrix (with original class names)
+class_names = label_encoder.classes_
+for model_name in models.keys():
+    cm = test_all_models_metrics[model_name]['confusion_matrix']
+    cm_df = pd.DataFrame(
+        cm,
+        index=[f"True_{cls}" for cls in class_names],
+        columns=[f"Pred_{cls}" for cls in class_names]
+    )
+    cm_df.to_csv(
+        os.path.join(OUTPUT_DIR, f"Test_{model_name}_Confusion_Matrix.csv"),
+        encoding='utf-8'
+    )
+
+##**************************************************************************************##
+##                     Step8. Perform SHAP Analysis (Model Interpretability)           ##
+##**************************************************************************************##
+# Keep only RandomForest SHAP analysis
+print(f"\n🔍 Starting SHAP analysis (model interpretability)")
+for model_name in models.keys():
+    print(f"\n--- Processing SHAP analysis for {model_name} ---")
+    final_model = cv_results[model_name]["final_model"]
+    # Call enhanced SHAP analysis function with y_true parameter
+    shap_analysis_tree(
+        model=final_model,
+        model_name=model_name,
+        X_data=X_test,  # Use test set for explanation (reflect generalization)
+        y_true=y_test,  # Add true label parameter
+        feature_names=feature_names,
+        label_encoder=label_encoder,
+        output_dir=OUTPUT_DIR
+    )
+
+##**************************************************************************************##
+##                     Step9. Output Final Results Summary                             ##
+##**************************************************************************************##
+print(f"\n" + "=" * 80)
+print(f"🎉 RandomForest modeling + SHAP analysis completed! Results saved to: {OUTPUT_DIR}")
+print(f"\n📁 Core File List:")
+print(f"  1. Cross-Validation Results:")
+print(f"     - CV_Full_Metrics_Report.xlsx: 20+ metrics including Accuracy/Kappa/MCC/AUC (multi-sheet)")
+print(f"     - Train_CV_RandomForest_ROC.pdf: RandomForest cross-validation ROC curve (with confidence interval)")
+print(f"  2. Test Set Results:")
+print(f"     - Test_Full_Metrics_Report.xlsx: Full test set metrics (directly reflect model generalization)")
+print(f"     - Test_RandomForest_ROC.pdf / Test_RandomForest_PR.pdf: RandomForest test set ROC/PR curves")
+print(f"     - Test_RandomForest_Confusion_Matrix.csv: Confusion matrix with original class names")
+print(f"  3. SHAP Analysis Results (Model Interpretability):")
+print(f"     - shap_beeswarm/: Class-specific beeswarm plots (fixed no-point issue)")
+print(f"     - shap_summary/: Feature importance bar plots and violin plots")
+print(f"     - shap_force/: Sample-level force plots (local explanation, fixed fx=1 issue)")
+print(f"     - shap_waterfall/: Sample-level waterfall plots (local explanation)")
+print(f"     - shap_dependence/: Feature dependence plots (global explanation)")
+print(f"\n💡 Result Interpretation Suggestions:")
+print(f"  1. Model Performance: Refer to MCC and Macro-AUC in Test_Full_Metrics_Report, higher values indicate better performance")
+print(f"  2. Class Performance: Focus on Recall and Specificity of minority classes to avoid imbalance bias")
+print(f"  3. Biomarkers: SNP sites with higher SHAP values have greater impact on host prediction, analyze with biological significance")
+print(f"  4. Local Explanation: Understand prediction basis for individual samples through force plots and waterfall plots, verify model decision rationality")
+print(f"=" * 80)
