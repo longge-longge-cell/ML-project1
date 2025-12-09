@@ -1,0 +1,1032 @@
+## XGBoost+SHAP: SNP Feature Multiclass Classification Model (Excel Metrics Output Version)
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import chardet
+import re
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (matthews_corrcoef, auc, roc_curve,
+                             classification_report, confusion_matrix,
+                             precision_recall_curve, cohen_kappa_score,
+                             precision_score, recall_score, f1_score,
+                             roc_auc_score)
+import xgboost as xgb
+import shap
+from shap.plots import waterfall
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+plt.switch_backend('Agg')
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+print(f"ℹ️ Current SHAP version: {shap.__version__}")
+print(f"ℹ️ Current XGBoost version: {xgb.__version__}")
+
+def detect_file_encoding(file_path):
+    with open(file_path, 'rb') as f:
+        raw_data = f.read(10000)
+        result = chardet.detect(raw_data)
+    encoding = result['encoding'] if result['encoding'] else 'gbk'
+    if encoding.lower() in ['windows-1252', 'iso-8859-1']:
+        encoding = 'gbk'
+    print(f"✅ Auto-detected file encoding: {encoding} (confidence: {result['confidence']:.2f})")
+    return encoding
+
+def plot_multiclass_roc(y_true, y_pred_proba, num_classes, save_path):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    mean_auc = 0.0
+
+    for class_idx in range(num_classes):
+        fpr, tpr, _ = roc_curve(y_true, y_pred_proba[:, class_idx], pos_label=class_idx)
+        roc_auc = auc(fpr, tpr)
+        mean_auc += roc_auc
+        ax.plot(fpr, tpr, color=colors[class_idx], linewidth=2,
+                label=f'Class {class_idx} (AUC = {roc_auc:.3f})')
+
+    mean_auc /= num_classes
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=2, alpha=0.8, label=f'Random Guess (AUC=0.5)')
+    ax.set_xlim([-0.05, 1.05])
+    ax.set_ylim([-0.05, 1.05])
+    ax.set_xlabel('False Positive Rate (FPR)', fontsize=10)
+    ax.set_ylabel('True Positive Rate (TPR/Sensitivity)', fontsize=10)
+    ax.set_title(f'XGBoost Test Set Multiclass ROC Curve (Mean AUC = {mean_auc:.3f})', fontsize=12)
+    ax.legend(fontsize=9, loc='lower right')
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    return mean_auc
+
+def plot_multiclass_pr(y_true, y_pred_proba, num_classes, save_path):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+
+    for class_idx in range(num_classes):
+        precision, recall, _ = precision_recall_curve(
+            y_true, y_pred_proba[:, class_idx], pos_label=class_idx
+        )
+        pr_auc = auc(recall, precision)
+        ax.plot(recall, precision, color=colors[class_idx], linewidth=2,
+                label=f'Class {class_idx} (AUCPR = {pr_auc:.3f})')
+
+    ax.set_xlim([-0.05, 1.05])
+    ax.set_ylim([-0.05, 1.05])
+    ax.set_xlabel('Recall (Sensitivity)', fontsize=10)
+    ax.set_ylabel('Precision', fontsize=10)
+    ax.set_title('XGBoost Test Set Multiclass PR Curve', fontsize=12)
+    ax.legend(fontsize=9, loc='lower left')
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+def calculate_multiclass_metrics(y_true, y_pred, y_pred_proba, num_classes, label_mapping):
+    accuracy = np.mean(y_true == y_pred)
+    kappa = cohen_kappa_score(y_true, y_pred)
+    macro_auc = roc_auc_score(y_true, y_pred_proba, multi_class='ovr', average='macro')
+    micro_auc = roc_auc_score(y_true, y_pred_proba, multi_class='ovr', average='micro')
+
+    class_metrics = {}
+    conf_mat = confusion_matrix(y_true, y_pred)
+    for class_idx in range(num_classes):
+        TP = conf_mat[class_idx, class_idx]
+        FN = conf_mat[class_idx, :].sum() - TP
+        FP = conf_mat[:, class_idx].sum() - TP
+        TN = conf_mat.sum() - (TP + FN + FP)
+
+        precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+        recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+        specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        class_metrics[class_idx] = {
+            'Precision': precision,
+            'Recall(Sensitivity)': recall,
+            'Specificity': specificity,
+            'F1-Score': f1,
+            'TP': TP,
+            'TN': TN,
+            'FP': FP,
+            'FN': FN
+        }
+
+    macro_precision = precision_score(y_true, y_pred, average='macro')
+    macro_recall = recall_score(y_true, y_pred, average='macro')
+    macro_f1 = f1_score(y_true, y_pred, average='macro')
+    weighted_f1 = f1_score(y_true, y_pred, average='weighted')
+
+    return {
+        'overall': {
+            'Accuracy': accuracy,
+            'Kappa': kappa,
+            'Macro-AUC': macro_auc,
+            'Micro-AUC': micro_auc,
+            'Macro-Precision': macro_precision,
+            'Macro-Recall': macro_recall,
+            'Macro-F1': macro_f1,
+            'Weighted-F1': weighted_f1
+        },
+        'class_level': class_metrics,
+        'confusion_matrix': conf_mat,
+        'label_mapping': label_mapping
+    }
+
+def print_metrics(metrics):
+    print("=" * 80)
+    print("📊 XGBoost Test Set Full Evaluation Metrics")
+    print("=" * 80)
+
+    print("\n【1. Overall Performance Metrics】")
+    overall = metrics['overall']
+    for key, val in overall.items():
+        print(f"   {key:<20}: {val:.4f}")
+
+    print("\n【2. Confusion Matrix】")
+    print("   Rows: True Class | Columns: Predicted Class")
+    print(f"   {metrics['confusion_matrix']}")
+
+    print("\n【3. Class-level Detailed Metrics】")
+    class_metrics = metrics['class_level']
+    code2label = {v: k for k, v in metrics['label_mapping'].items()}
+    print(
+        f"   {'Class Code':<10} {'Original Label':<15} {'Precision':<12} {'Recall(Sensitivity)':<20} {'Specificity':<12} {'F1-Score':<12} {'TP':<6} {'TN':<6} {'FP':<6} {'FN':<6}")
+    print("   " + "-" * 120)
+    for class_idx in sorted(class_metrics.keys()):
+        cm = class_metrics[class_idx]
+        raw_label = code2label.get(class_idx, f"Class {class_idx}")
+        print(
+            f"   {class_idx:<10} {raw_label:<15} {cm['Precision']:<12.4f} {cm['Recall(Sensitivity)']:<20.4f} {cm['Specificity']:<12.4f} {cm['F1-Score']:<12.4f} {cm['TP']:<6} {cm['TN']:<6} {cm['FP']:<6} {cm['FN']:<6}")
+    print("\n" + "=" * 80)
+
+def generate_metrics_excel(metrics, save_path, model_info=None):
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    center_alignment = Alignment(horizontal="center", vertical="center")
+
+    ws1 = wb.create_sheet(title="Overall Performance Metrics")
+    if model_info:
+        info_headers = ["Model Basic Info", "Value"]
+        for col, header in enumerate(info_headers, 1):
+            cell = ws1.cell(row=1, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_alignment
+
+        info_rows = [
+            ["Number of SNP Features", model_info.get("snp_count", "Unknown")],
+            ["Training Set Samples", model_info.get("train_samples", "Unknown")],
+            ["Test Set Samples", model_info.get("test_samples", "Unknown")],
+            ["Number of Classes", model_info.get("num_classes", "Unknown")],
+            ["Label Mapping (Original→Encoded)", str(model_info.get("label_mapping", "Unknown"))]
+        ]
+        for row, (key, val) in enumerate(info_rows, 2):
+            ws1.cell(row=row, column=1, value=key).alignment = center_alignment
+            ws1.cell(row=row, column=2, value=val).alignment = center_alignment
+
+        ws1.cell(row=len(info_rows) + 4, column=1, value="Overall Performance Metrics (Test Set)").font = Font(bold=True, size=12)
+
+    overall = metrics['overall']
+    metric_headers = ["Metric Name", "Metric Value (4 Decimal Places)", "Metric Explanation"]
+    start_row = len(info_rows) + 6 if model_info else 2
+    for col, header in enumerate(metric_headers, 1):
+        cell = ws1.cell(row=start_row, column=col, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_alignment
+
+    metric_explanations = {
+        'Accuracy': 'Overall accuracy: Number of correctly predicted samples / Total samples',
+        'Kappa': 'Cohen\'s Kappa: Consistency coefficient excluding random guess (0=no consistency, 1=perfect consistency)',
+        'Macro-AUC': 'Macro-average AUC: Arithmetic mean of AUC for each class (balanced class weights)',
+        'Micro-AUC': 'Micro-average AUC: AUC calculated from all samples\' TPR/FPR (reflects sample distribution)',
+        'Macro-Precision': 'Macro-average precision: Arithmetic mean of precision for each class',
+        'Macro-Recall': 'Macro-average recall: Arithmetic mean of recall for each class (=macro-average sensitivity)',
+        'Macro-F1': 'Macro-average F1: Arithmetic mean of F1 for each class (balances precision and recall)',
+        'Weighted-F1': 'Weighted F1: F1 weighted by class sample size (reflects actual sample distribution)'
+    }
+
+    for row, (metric_name, metric_val) in enumerate(overall.items(), start_row + 1):
+        ws1.cell(row=row, column=1, value=metric_name).alignment = center_alignment
+        ws1.cell(row=row, column=2, value=round(metric_val, 4)).alignment = center_alignment
+        ws1.cell(row=row, column=3, value=metric_explanations.get(metric_name, "None")).alignment = center_alignment
+
+    ws1.column_dimensions['A'].width = 20
+    ws1.column_dimensions['B'].width = 25
+    ws1.column_dimensions['C'].width = 50
+
+    ws2 = wb.create_sheet(title="Class-level Detailed Metrics")
+    class_metrics = metrics['class_level']
+    code2label = {v: k for k, v in metrics['label_mapping'].items()}
+
+    class_headers = [
+        "Class Code", "Original Label", "Precision",
+        "Recall(Sensitivity)", "Specificity",
+        "F1-Score", "TP (True Positive)", "TN (True Negative)", "FP (False Positive)", "FN (False Negative)"
+    ]
+    for col, header in enumerate(class_headers, 1):
+        cell = ws2.cell(row=1, column=col, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_alignment
+
+    for row, class_idx in enumerate(sorted(class_metrics.keys()), 2):
+        cm = class_metrics[class_idx]
+        raw_label = code2label.get(class_idx, f"Class {class_idx}")
+
+        ws2.cell(row=row, column=1, value=class_idx).alignment = center_alignment
+        ws2.cell(row=row, column=2, value=raw_label).alignment = center_alignment
+        ws2.cell(row=row, column=3, value=round(cm['Precision'], 4)).alignment = center_alignment
+        ws2.cell(row=row, column=4, value=round(cm['Recall(Sensitivity)'], 4)).alignment = center_alignment
+        ws2.cell(row=row, column=5, value=round(cm['Specificity'], 4)).alignment = center_alignment
+        ws2.cell(row=row, column=6, value=round(cm['F1-Score'], 4)).alignment = center_alignment
+        ws2.cell(row=row, column=7, value=int(cm['TP'])).alignment = center_alignment
+        ws2.cell(row=row, column=8, value=int(cm['TN'])).alignment = center_alignment
+        ws2.cell(row=row, column=9, value=int(cm['FP'])).alignment = center_alignment
+        ws2.cell(row=row, column=10, value=int(cm['FN'])).alignment = center_alignment
+
+    explain_row = len(class_metrics) + 4
+    ws2.cell(row=explain_row, column=1, value="Metric Explanations:").font = Font(bold=True)
+    explain_texts = [
+        "1. Precision: Proportion of samples predicted as this class that are actually this class",
+        "2. Recall(Sensitivity): Proportion of actual samples of this class that are correctly predicted",
+        "3. Specificity: Proportion of actual non-this-class samples that are correctly predicted",
+        "4. F1-Score: Harmonic mean of precision and recall (range 0-1, higher is better)",
+        "5. TP/TN/FP/FN: Confusion matrix elements calculated by one-vs-rest strategy (current class as positive, others as negative)"
+    ]
+    for i, text in enumerate(explain_texts, explain_row + 1):
+        ws2.cell(row=i, column=1, value=text).alignment = center_alignment
+        ws2.merge_cells(start_row=i, start_column=1, end_row=i, end_column=10)
+
+    column_widths = [12, 15, 20, 30, 20, 18, 12, 12, 12, 12]
+    for col, width in enumerate(column_widths, 1):
+        ws2.column_dimensions[chr(64 + col)].width = width
+
+    ws3 = wb.create_sheet(title="Confusion Matrix")
+    conf_mat = metrics['confusion_matrix']
+    num_classes = conf_mat.shape[0]
+    code2label = {v: k for k, v in metrics['label_mapping'].items()}
+
+    ws3.cell(row=1, column=1, value="Confusion Matrix (Rows=True Class | Columns=Predicted Class)").font = Font(bold=True, size=12)
+    ws3.merge_cells(start_row=1, start_column=1, end_row=1, end_column=num_classes + 2)
+
+    ws3.cell(row=2, column=1, value="True Class").font = header_font
+    ws3.cell(row=2, column=1).fill = header_fill
+    ws3.cell(row=2, column=1).alignment = center_alignment
+    for col, class_idx in enumerate(range(num_classes), 2):
+        cell = ws3.cell(row=2, column=col, value=f"Pred_{class_idx}")
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_alignment
+
+    ws3.cell(row=3, column=1, value="Original Label").font = header_font
+    ws3.cell(row=3, column=1).fill = header_fill
+    ws3.cell(row=3, column=1).alignment = center_alignment
+    for col, class_idx in enumerate(range(num_classes), 2):
+        raw_label = code2label.get(class_idx, f"Class {class_idx}")
+        cell = ws3.cell(row=3, column=col, value=raw_label)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_alignment
+
+    for row, true_class in enumerate(range(num_classes), 4):
+        ws3.cell(row=row, column=1, value=f"True_{true_class}").alignment = center_alignment
+        raw_label = code2label.get(true_class, f"Class {true_class}")
+        ws3.cell(row=row + 1, column=1, value=raw_label).alignment = center_alignment
+
+        for col, pred_class in enumerate(range(num_classes), 2):
+            value = conf_mat[true_class, pred_class]
+            cell = ws3.cell(row=row, column=col, value=value)
+            cell.alignment = center_alignment
+            if true_class == pred_class:
+                cell.fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+        ws3.cell(row=row + 2, column=1, value="").alignment = center_alignment
+
+    explain_row = num_classes * 3 + 6
+    ws3.cell(row=explain_row, column=1, value="Explanations:").font = Font(bold=True)
+    ws3.cell(row=explain_row + 1, column=1, value="1. Diagonal elements: Number of correct predictions (highlighted in yellow)")
+    ws3.cell(row=explain_row + 2, column=1, value="2. Non-diagonal elements: Number of incorrect predictions (Rows=True Class, Columns=Predicted Class)")
+    ws3.cell(row=explain_row + 3, column=1, value="3. Sum of each row: Total samples of the corresponding true class; Sum of each column: Total samples of the corresponding predicted class")
+
+    ws3.column_dimensions['A'].width = 15
+    for col in range(2, num_classes + 2):
+        ws3.column_dimensions[chr(64 + col)].width = 18
+
+    try:
+        wb.save(save_path)
+        print(f"✅ Excel metrics report saved to: {save_path}")
+    except Exception as e:
+        raise RuntimeError(f"❌ Failed to save Excel file: {str(e)}")
+
+def parse_feature_index(feature_name):
+    try:
+        return int(feature_name)
+    except ValueError:
+        match = re.search(r'\d+', feature_name)
+        if match:
+            return int(match.group())
+        else:
+            raise ValueError(f"Cannot parse feature name: {feature_name}")
+
+def plot_xgb_feature_importance(model, feature_names, save_path, top_n=20):
+    model_feature_num = model.num_features()
+    if len(feature_names) != model_feature_num:
+        raise ValueError(
+            f"❌ Feature name length ({len(feature_names)}) does not match model feature count ({model_feature_num})!"
+        )
+
+    importance = model.get_score(importance_type='gain')
+    idx_to_name = {i: name for i, name in enumerate(feature_names)}
+    importance_df = pd.DataFrame({
+        'SNP Locus': [idx_to_name[parse_feature_index(idx)] for idx in importance.keys()],
+        'Information Gain': list(importance.values())
+    }).sort_values('Information Gain', ascending=False).head(top_n)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    y_pos = np.arange(len(importance_df))
+    ax.barh(y_pos, importance_df['Information Gain'], align='center', color='#1f77b4', alpha=0.8)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(importance_df['SNP Locus'], fontsize=9)
+    ax.set_xlabel('Information Gain (Gain)', fontsize=10)
+    ax.set_ylabel('SNP Locus', fontsize=10)
+    ax.set_title(f'Top {top_n} Important SNP Loci in XGBoost Model (Information Gain)', fontsize=12)
+    ax.grid(axis='x', alpha=0.3)
+    ax.invert_yaxis()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ XGBoost feature importance plot saved successfully")
+
+def ensure_2d_array(arr, name="data"):
+    if isinstance(arr, pd.DataFrame):
+        arr = arr.values
+        print(f"ℹ️ {name} (DataFrame) converted to NumPy array: {arr.shape}")
+
+    if not isinstance(arr, np.ndarray):
+        arr = np.array(arr)
+
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+        print(f"⚠️ {name} is 1D array, auto-converted to 2D: {arr.shape}")
+    elif arr.ndim == 3:
+        arr = arr.squeeze(axis=-1)
+        print(f"⚠️ {name} is 3D array, auto-reduced to 2D: {arr.shape}")
+    elif arr.ndim != 2:
+        raise ValueError(f"❌ {name} must be 1D/2D/3D array, current is {arr.ndim}D")
+
+    return arr
+
+def is_empty_data(data, data_type="DataFrame"):
+    if data_type == "DataFrame":
+        return data.empty
+    elif data_type == "ndarray":
+        return data.size == 0
+    else:
+        raise ValueError(f"❌ Unsupported data type: {data_type}")
+
+def align_shap_and_features(shap_vals, features, class_idx=0):
+    shap_vals_2d = ensure_2d_array(shap_vals, name=f"SHAP values for class {class_idx}")
+    features_2d = ensure_2d_array(features, name="input data")
+
+    print(f"ℹ️ Dimension alignment check:")
+    print(f"   - Input data shape: {features_2d.shape} (n_samples × n_features)")
+    print(f"   - SHAP values shape for class {class_idx}: {shap_vals_2d.shape}")
+
+    n_samples = features_2d.shape[0]
+    n_features = features_2d.shape[1]
+
+    if shap_vals_2d.shape == (n_features, n_samples):
+        shap_vals_2d = shap_vals_2d.T
+        print(f"⚠️ SHAP values rows/columns reversed, transposed to: {shap_vals_2d.shape}")
+    elif shap_vals_2d.shape[0] != n_samples or shap_vals_2d.shape[1] != n_features:
+        raise RuntimeError(
+            f"❌ SHAP values cannot align with input data shape!\n"
+            f"   - Input data: {n_samples} samples × {n_features} features\n"
+            f"   - SHAP values: {shap_vals_2d.shape[0]} samples × {shap_vals_2d.shape[1]} features"
+        )
+
+    if shap_vals_2d.shape[1] != n_features:
+        raise RuntimeError(
+            f"❌ SHAP values feature count does not match input data!\n"
+            f"   - SHAP values feature count: {shap_vals_2d.shape[1]}\n"
+            f"   - Input data feature count: {n_features}"
+        )
+
+    print(f"✅ Dimension alignment completed: Both SHAP values and input data are {shap_vals_2d.shape}")
+    return shap_vals_2d, features_2d
+
+def normalize_shap_values(shap_values, num_classes):
+    if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+        print(f"ℹ️ Detected 3D SHAP array, shape: {shap_values.shape}")
+
+        if shap_values.shape[2] == num_classes:
+            print(f"⚠️ Low version 3D SHAP array, auto-transposed to (num_classes × n_samples × n_features)")
+            shap_values = np.transpose(shap_values, axes=(2, 0, 1))
+            print(f"ℹ️ Transposed SHAP array shape: {shap_values.shape}")
+
+        if shap_values.shape[0] == num_classes:
+            print(f"✅ Correct 3D array format, split into {num_classes} class list")
+            return [shap_values[i] for i in range(num_classes)]
+        else:
+            raise ValueError(
+                f"❌ SHAP 3D array dimension still incorrect!\n"
+                f"   - Transposed shape: {shap_values.shape}\n"
+                f"   - Expected first dimension: {num_classes} (number of classes)"
+            )
+
+    if isinstance(shap_values, list) and len(shap_values) != num_classes:
+        sample_shap = shap_values[0] if shap_values else None
+        if isinstance(sample_shap, np.ndarray) and sample_shap.ndim == 2:
+            combined = np.stack(shap_values, axis=0)
+            if combined.ndim == 3 and combined.shape[2] == num_classes:
+                print(f"ℹ️ SHAP value list length mismatch, auto-converted to class list: {combined.shape} → {num_classes} classes")
+                return [combined[:, :, i] for i in range(num_classes)]
+            else:
+                raise ValueError(
+                    f"❌ Cannot convert SHAP value format!\n"
+                    f"   - List length: {len(shap_values)}\n"
+                    f"   - Sample SHAP shape: {sample_shap.shape}\n"
+                    f"   - Expected number of classes: {num_classes}"
+                )
+
+    return shap_values
+
+def shap_global_explanations(model, X_test, feature_names, save_dir, num_samples=100, target_class=0, num_classes=4):
+    model_feature_num = model.num_features()
+    print(f"ℹ️ Expected model feature count: {model_feature_num}")
+
+    if isinstance(X_test, pd.DataFrame):
+        X_test_sample = X_test.iloc[:num_samples]
+        if is_empty_data(X_test_sample, data_type="DataFrame"):
+            raise ValueError(f"❌ X_test_sample (DataFrame) is empty!")
+        print(f"ℹ️ X_test_sample (DataFrame) shape: {X_test_sample.shape}")
+    else:
+        X_test = ensure_2d_array(X_test, name="original X_test")
+        X_test_sample = X_test[:num_samples]
+        if is_empty_data(X_test_sample, data_type="ndarray"):
+            raise ValueError(f"❌ X_test_sample (NumPy array) is empty!")
+        print(f"ℹ️ X_test_sample (NumPy array) shape: {X_test_sample.shape}")
+
+    X_test_sample = ensure_2d_array(X_test_sample, name="X_test_sample")
+    n_samples, data_feature_num = X_test_sample.shape
+
+    if model_feature_num != data_feature_num:
+        raise RuntimeError(
+            f"❌ Severe mismatch between model and data feature count!\n"
+            f"   - Model feature count: {model_feature_num}\n"
+            f"   - X_test_sample feature count: {data_feature_num}"
+        )
+
+    if len(feature_names) != data_feature_num:
+        raise ValueError(
+            f"❌ Feature name length ({len(feature_names)}) does not match data feature count ({data_feature_num})!"
+        )
+
+    print(f"ℹ️ Start calculating SHAP values (target class: {target_class}, total classes: {num_classes})...")
+    explainer = shap.TreeExplainer(model)
+
+    shap_kwargs = {}
+    if shap.__version__ >= "0.40.0":
+        shap_kwargs["check_additivity"] = False
+    print(f"ℹ️ SHAP calculation parameters: {shap_kwargs} (adapted to current version: {shap.__version__})")
+
+    shap_values = explainer.shap_values(X_test_sample,** shap_kwargs)
+    print(
+        f"ℹ️ Original SHAP values info: Type={type(shap_values)}, Length/Shape={len(shap_values) if isinstance(shap_values, list) else shap_values.shape}")
+
+    shap_values = normalize_shap_values(shap_values, num_classes)
+
+    if not isinstance(shap_values, list) or len(shap_values) != num_classes:
+        raise RuntimeError(
+            f"❌ Normalized SHAP values format still incorrect!\n"
+            f"   - Type: {type(shap_values)}\n"
+            f"   - Length: {len(shap_values) if isinstance(shap_values, list) else 'non-list'}\n"
+            f"   - Expected: List with length {num_classes}"
+        )
+    print(f"✅ SHAP values format verification passed: Length={len(shap_values)} (consistent with number of classes)")
+
+    target_shap_vals = shap_values[target_class]
+    target_shap_vals_aligned, X_test_sample_aligned = align_shap_and_features(
+        target_shap_vals, X_test_sample, class_idx=target_class
+    )
+
+    print(f"ℹ️ Start plotting SHAP summary plot (target class: {target_class})...")
+    plt.figure(figsize=(12, 8))
+    try:
+        shap.summary_plot(
+            shap_values=target_shap_vals_aligned,
+            features=X_test_sample_aligned,
+            feature_names=feature_names,
+            plot_type="dot",
+            show=False
+        )
+    except Exception as e:
+        print(f"⚠️ Summary plot parameter compatibility failed, plotting in simplified mode: {str(e)[:100]}")
+        shap.summary_plot(
+            shap_values=target_shap_vals_aligned,
+            features=X_test_sample_aligned,
+            feature_names=feature_names,
+            plot_type="dot",
+            show=False
+        )
+
+    ax = plt.gca()
+    ax.set_title(f'SHAP Global Summary Plot (Target Class: {target_class})', fontsize=12, pad=20)
+    ax.set_xlabel(f'SHAP Value (Positive: Promote prediction as class {target_class}; Negative: Inhibit)', fontsize=10)
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, f"shap_summary_plot_class{target_class}.pdf")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ SHAP global summary plot (class {target_class}) saved successfully")
+
+    print(f"ℹ️ Start plotting SHAP dependence plots...")
+    shap_abs_mean = np.mean(np.abs(target_shap_vals_aligned), axis=0)
+    top_k = min(3, data_feature_num)
+    top_feature_idx = np.argsort(shap_abs_mean)[-top_k:][::-1]
+
+    for i, feat_idx in enumerate(top_feature_idx):
+        feat_name = feature_names[feat_idx]
+        plt.figure(figsize=(10, 6))
+        try:
+            shap.dependence_plot(
+                feat_idx,
+                target_shap_vals_aligned,
+                X_test_sample_aligned,
+                feature_names=feature_names,
+                show=False
+            )
+        except Exception as e:
+            print(f"⚠️ Dependence plot parameter compatibility failed, plotting in simplified mode: {str(e)[:100]}")
+            shap.dependence_plot(
+                feat_idx,
+                target_shap_vals_aligned,
+                X_test_sample_aligned,
+                feature_names=feature_names,
+                show=False
+            )
+
+        ax = plt.gca()
+        ax.set_title(f'SHAP Dependence Plot: {feat_name} (Prediction Contribution for Class {target_class})', fontsize=12)
+        ax.set_xlabel(f'{feat_name} Locus Value', fontsize=10)
+        ax.set_ylabel(f'SHAP Value (Positive promotes prediction as class {target_class})', fontsize=10)
+        plt.tight_layout()
+        dep_save_path = os.path.join(save_dir, f"shap_dependence_{feat_name}_class{target_class}.pdf")
+        plt.savefig(dep_save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✅ SHAP dependence plot: {feat_name} saved successfully")
+
+    return explainer, shap_values
+
+def shap_local_explanations(explainer, shap_values, X_test, y_test, y_pred, feature_names, save_dir, sample_idx=0,
+                            num_classes=4):
+    if isinstance(X_test, pd.DataFrame):
+        sample_x = X_test.iloc[sample_idx:sample_idx + 1]
+        sample_x = ensure_2d_array(sample_x, name=f"Features of sample {sample_idx}")
+    else:
+        X_test = ensure_2d_array(X_test, name="original X_test")
+        sample_x = X_test[sample_idx].reshape(1, -1)
+        sample_x = ensure_2d_array(sample_x, name=f"Features of sample {sample_idx}")
+
+    sample_y_true = y_test[sample_idx]
+    sample_y_pred = y_pred[sample_idx]
+    print(f"ℹ️ Explaining sample {sample_idx + 1}: True class={sample_y_true}, Predicted class={sample_y_pred}")
+
+    shap_kwargs = {}
+    if shap.__version__ >= "0.40.0":
+        shap_kwargs["check_additivity"] = False
+    sample_shap_vals = explainer.shap_values(sample_x, **shap_kwargs)
+    sample_shap_vals = normalize_shap_values(sample_shap_vals, num_classes)
+
+    sample_shap_vals_pred = sample_shap_vals[sample_y_pred]
+    sample_shap_vals_pred, sample_x_aligned = align_shap_and_features(
+        sample_shap_vals_pred, sample_x, class_idx=sample_y_pred
+    )
+
+    sample_feature_names = [str(name) for name in feature_names]
+    sample_features = pd.DataFrame(
+        sample_x_aligned,
+        columns=sample_feature_names
+    )
+    print(f"ℹ️ Sample {sample_idx + 1} feature format verification:")
+    print(f"   - Feature name type: {type(sample_feature_names[0])} (should be str)")
+    print(f"   - Feature value type: {type(sample_features.iloc[0, 0])} (float allowed)")
+
+    plt.figure(figsize=(12, 8))
+    waterfall(
+        shap.Explanation(
+            values=sample_shap_vals_pred[0],
+            base_values=explainer.expected_value[sample_y_pred],
+            data=sample_features.iloc[0],
+            feature_names=sample_feature_names
+        ),
+        max_display=10,
+        show=False
+    )
+    ax = plt.gca()
+    ax.set_title(f'SHAP Local Explanation (Sample {sample_idx + 1})\nTrue Class: {sample_y_true}, Predicted Class: {sample_y_pred}', fontsize=12,
+                 pad=20)
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, f"shap_local_sample{sample_idx + 1}_class{sample_y_pred}.pdf")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✅ SHAP local explanation (sample {sample_idx + 1}) saved successfully")
+
+SNP_TSV_PATH = r"D:\ML\try5\after.tsv"
+HOST_XLSX_PATH = r"D:\ML\try5\host.xlsx"
+OUTPUT_DIR = r"D:\ML\try5\output_results1"
+EXPECTED_SNP_NUM = 8210
+NUM_CLASSES = 4
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+print(f"📁 Result save directory: {OUTPUT_DIR}")
+
+try:
+    if not os.path.exists(SNP_TSV_PATH):
+        raise FileNotFoundError(f"SNP file does not exist: {SNP_TSV_PATH}")
+    if not SNP_TSV_PATH.endswith('.tsv'):
+        print(f"⚠️ Warning: SNP file suffix is not .tsv")
+
+    snp_encoding = detect_file_encoding(SNP_TSV_PATH)
+
+    snp_data = pd.read_csv(
+        SNP_TSV_PATH,
+        sep='\t',
+        index_col=0,
+        header=0,
+        encoding=snp_encoding,
+        low_memory=False
+    )
+    print(f"✅ Original SNP data shape: {snp_data.shape} (Number of SNP loci × Number of strains)")
+
+    non_numeric_cols = []
+    for col in snp_data.columns:
+        try:
+            pd.to_numeric(snp_data[col])
+        except ValueError:
+            non_numeric_cols.append(col)
+
+    if non_numeric_cols:
+        print(f"⚠️ Found {len(non_numeric_cols)} columns with non-numeric data, attempting to clean...")
+        print(f"   Examples: {non_numeric_cols[:3]}")
+
+        for col in non_numeric_cols:
+            snp_data[col] = pd.to_numeric(
+                snp_data[col].astype(str).str.extract(r'(\d+\.?\d*)', expand=False),
+                errors='coerce'
+            )
+
+        nan_cols = snp_data.columns[snp_data.isna().any()].tolist()
+        if nan_cols:
+            print(f"⚠️ {len(nan_cols)} columns still contain NaN values after cleaning, deleting these columns...")
+            snp_data = snp_data.drop(columns=nan_cols)
+            print(f"ℹ️ SNP data shape after cleaning: {snp_data.shape}")
+
+    try:
+        snp_data = snp_data.astype(np.float32)
+        print(f"✅ All data columns converted to float32 type successfully")
+    except ValueError as e:
+        print(f"⚠️ Some columns cannot be converted to numeric, deleting invalid columns...")
+        bad_cols = []
+        for col in snp_data.columns:
+            try:
+                snp_data[col].astype(np.float32)
+            except:
+                bad_cols.append(col)
+        snp_data = snp_data.drop(columns=bad_cols)
+        snp_data = snp_data.astype(np.float32)
+        print(f"ℹ️ Data shape after deleting invalid columns: {snp_data.shape}")
+
+    if not isinstance(snp_data.index[0], str):
+        snp_data.index = snp_data.index.astype(str)
+        print(f"⚠️ SNP locus names converted to str type")
+
+    if snp_data.shape[0] != EXPECTED_SNP_NUM:
+        print(f"⚠️ Warning: Number of SNP loci ({snp_data.shape[0]}) does not match expected ({EXPECTED_SNP_NUM})!")
+
+    snp_transposed = snp_data.transpose()
+    print(f"✅ SNP data shape after transposition: {snp_transposed.shape} (Number of strains × Number of SNP loci)")
+
+    if is_empty_data(snp_transposed, data_type="DataFrame"):
+        raise ValueError("❌ SNP data is empty after transposition")
+
+    snp_transposed_array = ensure_2d_array(snp_transposed, name="Transposed SNP data")
+    print(f"✅ Transposed SNP array shape: {snp_transposed_array.shape}")
+
+except Exception as e:
+    raise RuntimeError(
+        f"❌ Failed to read SNP file: {str(e)}\n"
+        f"Troubleshooting steps:\n"
+        f"1. Confirm file path is correct: {SNP_TSV_PATH}\n"
+        f"2. Confirm file is tab-separated .tsv format\n"
+        f"3. Check if data columns contain non-numeric strings"
+    )
+
+try:
+    if not os.path.exists(HOST_XLSX_PATH):
+        raise FileNotFoundError(f"Host label file does not exist: {HOST_XLSX_PATH}")
+
+    host_data = pd.read_excel(HOST_XLSX_PATH, engine='openpyxl')
+    host_data = host_data.dropna(subset=[host_data.columns[0], host_data.columns[1]])
+    print(f"✅ Host label data shape: {host_data.shape}")
+
+    if len(host_data.columns) < 2:
+        raise ValueError("❌ Host label file requires at least 2 columns (Strain ID + Host Label)")
+
+    strain_id_col = host_data.columns[0]
+    host_label_col = host_data.columns[1]
+    print(f"🔍 Strain ID column name: {strain_id_col}, Host label column name: {host_label_col}")
+
+    if host_data[strain_id_col].duplicated().any():
+        dup_count = host_data[strain_id_col].duplicated().sum()
+        host_data = host_data.drop_duplicates(subset=strain_id_col, keep='first')
+        print(f"⚠️ {dup_count} duplicate strain IDs found in host label file, retained first occurrence")
+
+    label_encoder = LabelEncoder()
+    host_data['encoded_label'] = label_encoder.fit_transform(host_data[host_label_col])
+    label_mapping = dict(zip(label_encoder.classes_, range(len(label_encoder.classes_))))
+    print(f"🏷️ Host label encoding mapping: {label_mapping}")
+
+    if len(label_mapping) != NUM_CLASSES:
+        raise ValueError(
+            f"❌ Number of label classes does not match expected!\n"
+            f"   - Actual number of classes: {len(label_mapping)}\n"
+            f"   - Expected number of classes: {NUM_CLASSES}"
+        )
+    print(f"✅ Confirmed number of host classes: {NUM_CLASSES} classes")
+except Exception as e:
+    raise RuntimeError(
+        f"❌ Failed to read host label file: {str(e)}\n"
+        f"Troubleshooting steps:\n"
+        f"1. Confirm file path is correct: {HOST_XLSX_PATH}\n"
+        f"2. Confirm file contains {NUM_CLASSES} host label classes"
+    )
+
+snp_strains = set(snp_transposed.index.astype(str))
+host_strains = set(host_data[strain_id_col].astype(str))
+common_strains = list(snp_strains & host_strains)
+
+if len(common_strains) == 0:
+    raise ValueError(
+        f"❌ No matching strain IDs found!\n"
+        f"   - Number of strains in SNP file: {len(snp_strains)}\n"
+        f"   - Number of strains in host label file: {len(host_strains)}"
+    )
+print(f"✅ Matched {len(common_strains)} common strains")
+
+snp_filtered = snp_transposed.loc[common_strains].sort_index()
+if is_empty_data(snp_filtered, data_type="DataFrame"):
+    raise ValueError("❌ SNP data is empty after filtering!")
+
+if snp_filtered.shape[1] != snp_transposed.shape[1]:
+    raise ValueError(
+        f"❌ SNP loci lost after data alignment!\n"
+        f"   - Before alignment: {snp_transposed.shape[1]} loci\n"
+        f"   - After alignment: {snp_filtered.shape[1]} loci"
+    )
+
+host_filtered = host_data[host_data[strain_id_col].astype(str).isin(common_strains)]
+host_filtered = host_filtered.set_index(strain_id_col).reindex(snp_filtered.index).reset_index()
+
+if len(snp_filtered) != len(host_filtered):
+    raise ValueError(
+        f"❌ Mismatch between feature and label sample count!\n"
+        f"   - SNP data: {len(snp_filtered)} samples\n"
+        f"   - Label data: {len(host_filtered)} samples"
+    )
+print(f"✅ Data alignment completed: {len(snp_filtered)} samples, {snp_filtered.shape[1]} SNP loci")
+
+X = ensure_2d_array(snp_filtered, name="Final X")
+y = host_filtered['encoded_label'].values
+feature_names = [str(col) for col in snp_filtered.columns.tolist()]
+non_str_count = sum(1 for name in feature_names if not isinstance(name, str))
+if non_str_count > 0:
+    print(f"⚠️ Warning: {non_str_count} feature names are not strings, forced conversion")
+else:
+    print(f"✅ All feature names (SNP loci) are string type")
+
+print(f"\n📊 Modeling data summary:")
+print(f"   - X shape: {X.shape} (Number of samples × Number of SNP loci)")
+print(f"   - y shape: {y.shape} (Number of samples)")
+print(f"   - Number of feature names: {len(feature_names)} (all strings)")
+print(f"   - Label distribution: {np.bincount(y)}")
+
+X = ensure_2d_array(X, name="X before split")
+split_before_feature_num = X.shape[1]
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=123
+)
+
+X_train = ensure_2d_array(X_train, name="Training set X")
+X_test = ensure_2d_array(X_test, name="Test set X")
+if X_train.shape[1] != split_before_feature_num or X_test.shape[1] != split_before_feature_num:
+    raise ValueError(
+        f"❌ Feature count changed after data split!\n"
+        f"   - Before split: {split_before_feature_num} features\n"
+        f"   - Training set: {X_train.shape[1]} features\n"
+        f"   - Test set: {X_test.shape[1]} features"
+    )
+
+print(f"\n📝 Data split completed:")
+print(f"   - Training set: X={X_train.shape}, y={y_train.shape}, label distribution {np.bincount(y_train)}")
+print(f"   - Test set: X={X_test.shape}, y={y_test.shape}, label distribution {np.bincount(y_test)}")
+
+dtrain = xgb.DMatrix(X_train, label=y_train)
+dtest = xgb.DMatrix(X_test, label=y_test)
+print(
+    f"✅ DMatrix format:\n   - dtrain: {dtrain.num_row()} rows × {dtrain.num_col()} columns\n   - dtest: {dtest.num_row()} rows × {dtest.num_col()} columns")
+if dtrain.num_col() != split_before_feature_num:
+    raise ValueError(f"❌ DMatrix feature count error! dtrain={dtrain.num_col()} columns, expected={split_before_feature_num} columns")
+
+params = {
+    'objective': 'multi:softprob',
+    'num_class': NUM_CLASSES,
+    'eval_metric': 'mlogloss',
+    'booster': 'gbtree',
+    'max_depth': 6,
+    'learning_rate': 0.05,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'random_state': 123,
+    'verbosity': 0
+}
+num_boost_round = 200
+
+num_folds = 5
+kfold = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=123)
+cv_scores = []
+cv_f1_scores = []
+fold_no = 1
+
+print(f"\n🚀 Start {num_folds}-fold cross-validation training of XGBoost model...")
+for train_idx, val_idx in kfold.split(X_train, y_train):
+    X_cv_train, X_cv_val = X_train[train_idx], X_train[val_idx]
+    y_cv_train, y_cv_val = y_train[train_idx], y_train[val_idx]
+
+    X_cv_train = ensure_2d_array(X_cv_train, name=f"Fold {fold_no} training data")
+    if X_cv_train.shape[1] != split_before_feature_num:
+        raise ValueError(f"❌ Fold {fold_no} training data feature count error")
+
+    dcv_train = xgb.DMatrix(X_cv_train, label=y_cv_train)
+    dcv_val = xgb.DMatrix(X_cv_val, label=y_cv_val)
+
+    print(f"\n{'=' * 50}")
+    print(f"Training Fold {fold_no} model...")
+    model_cv = xgb.train(
+        params,
+        dcv_train,
+        num_boost_round=num_boost_round,
+        evals=[(dcv_val, 'val')],
+        early_stopping_rounds=20,
+        verbose_eval=20
+    )
+
+    cv_model_feat_num = model_cv.num_features()
+    if cv_model_feat_num != split_before_feature_num:
+        raise ValueError(f"❌ Fold {fold_no} model feature count error")
+
+    y_cv_val_pred_proba = model_cv.predict(dcv_val)
+    y_cv_val_pred = np.argmax(y_cv_val_pred_proba, axis=1)
+    cv_acc = np.mean(y_cv_val_pred == y_cv_val)
+    cv_f1 = f1_score(y_cv_val, y_cv_val_pred, average='weighted')
+    cv_scores.append(cv_acc)
+    cv_f1_scores.append(cv_f1)
+
+    print(f"Fold {fold_no} validation set results: Accuracy={cv_acc:.4f}, Weighted F1={cv_f1:.4f}")
+    fold_no += 1
+
+print(f"\n📊 {num_folds}-fold cross-validation summary:")
+print(f"   - Mean accuracy: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
+print(f"   - Mean weighted F1: {np.mean(cv_f1_scores):.4f} ± {np.std(cv_f1_scores):.4f}")
+
+print(f"\n✅ Training final XGBoost model...")
+final_model = xgb.train(
+    params,
+    dtrain,
+    num_boost_round=num_boost_round,
+    verbose_eval=20
+)
+
+final_model_feat_num = final_model.num_features()
+if final_model_feat_num != split_before_feature_num:
+    raise RuntimeError(f"❌ Final model feature count error!")
+print(f"✅ Final model verification passed: Feature count={final_model_feat_num}")
+
+model_save_path = os.path.join(OUTPUT_DIR, "xgboost_final_model.ubj")
+final_model.save_model(model_save_path)
+print(f"✅ Model saved to: {model_save_path}")
+
+y_test_pred_proba = final_model.predict(dtest)
+y_test_pred = np.argmax(y_test_pred_proba, axis=1)
+print(f"\n✅ Test set prediction completed:\n   - Predicted probability shape: {y_test_pred_proba.shape}\n   - Predicted class shape: {y_test_pred.shape}")
+
+all_metrics = calculate_multiclass_metrics(
+    y_true=y_test,
+    y_pred=y_test_pred,
+    y_pred_proba=y_test_pred_proba,
+    num_classes=NUM_CLASSES,
+    label_mapping=label_mapping
+)
+
+print_metrics(all_metrics)
+
+excel_save_path = os.path.join(OUTPUT_DIR, "XGBoost_Model_Evaluation_Metrics_Report.xlsx")
+model_info = {
+    "snp_count": final_model_feat_num,
+    "train_samples": len(X_train),
+    "test_samples": len(X_test),
+    "num_classes": NUM_CLASSES,
+    "label_mapping": label_mapping
+}
+generate_metrics_excel(
+    metrics=all_metrics,
+    save_path=excel_save_path,
+    model_info=model_info
+)
+
+mean_auc = plot_multiclass_roc(
+    y_true=y_test,
+    y_pred_proba=y_test_pred_proba,
+    num_classes=NUM_CLASSES,
+    save_path=os.path.join(OUTPUT_DIR, "xgboost_test_roc.pdf")
+)
+plot_multiclass_pr(
+    y_true=y_test,
+    y_pred_proba=y_test_pred_proba,
+    num_classes=NUM_CLASSES,
+    save_path=os.path.join(OUTPUT_DIR, "xgboost_test_pr.pdf")
+)
+plot_xgb_feature_importance(
+    model=final_model,
+    feature_names=feature_names,
+    save_path=os.path.join(OUTPUT_DIR, "xgboost_feature_importance.pdf"),
+    top_n=20
+)
+
+print(f"\n📊 Start SHAP model explanation (target class: 0, total classes: {NUM_CLASSES})...")
+shap_explainer, shap_values = shap_global_explanations(
+    model=final_model,
+    X_test=X_test,
+    feature_names=feature_names,
+    save_dir=OUTPUT_DIR,
+    num_samples=min(100, len(X_test)),
+    target_class=0,
+    num_classes=NUM_CLASSES
+)
+
+for sample_idx in [0, 1]:
+    if sample_idx >= len(X_test):
+        break
+    shap_local_explanations(
+        explainer=shap_explainer,
+        shap_values=shap_values,
+        X_test=X_test,
+        y_test=y_test,
+        y_pred=y_test_pred,
+        feature_names=feature_names,
+        save_dir=OUTPUT_DIR,
+        sample_idx=sample_idx,
+        num_classes=NUM_CLASSES
+    )
+
+with open(os.path.join(OUTPUT_DIR, "xgboost_test_summary.txt"), "w", encoding='utf-8') as f:
+    f.write("=" * 80 + " XGBoost Model Evaluation Summary (Full Metrics Version) " + "=" * 80 + "\n\n")
+    f.write(f"1. Basic Information:\n")
+    f.write(f"   - Number of SNP loci: {final_model_feat_num}\n")
+    f.write(f"   - Training set samples: {len(X_train)}, Test set samples: {len(X_test)}\n")
+    f.write(f"   - Host label mapping (Original Label→Encoded): {label_mapping}\n")
+    f.write(f"   - Number of classes: {NUM_CLASSES}\n\n")
+
+    f.write(f"2. Overall Performance Metrics:\n")
+    overall = all_metrics['overall']
+    for key, val in overall.items():
+        f.write(f"   - {key:<20}: {val:.4f}\n")
+    f.write(f"\n")
+
+    f.write(f"3. Class-level detailed metrics see Excel report: {excel_save_path}\n")
+    f.write(f"4. Confusion matrix see Excel report: {excel_save_path}\n")
+
+print(f"\n✅ All results (including Excel metrics report) saved successfully!")
+print(f"📁 Result directory: {OUTPUT_DIR}")
+print(f"📊 Excel metrics report path: {excel_save_path}")
+
+print(f"\n" + "=" * 80)
+print(f"🎉 Excel Metrics Report Function Description:")
+print(f"\n1. Worksheet Structure:")
+print(f"   - Worksheet 1 'Overall Performance Metrics': Contains model basic info, overall metrics (Accuracy/Kappa/AUC etc.) and metric explanations\n")
+print(f"   - Worksheet 2 'Class-level Detailed Metrics': Precision/Recall/Sensitivity/Specificity etc. for each class, labeled with original labels\n")
+print(f"   - Worksheet 3 'Confusion Matrix': Rows=True Class, Columns=Predicted Class, diagonal (correct predictions) highlighted in yellow\n")
+print(f"2. Format Optimization:")
+print(f"   - Header bold + blue background, values retained to 4 decimal places, key data highlighted (e.g., correct predictions)\n")
+print(f"   - Each worksheet contains metric explanations to avoid understanding ambiguity (e.g., 'Recall=Sensitivity')\n")
+print(f"3. Usage:")
+print(f"   - Directly used for data collation in papers/project reports\n")
+print(f"   - Supports further modification (e.g., adding significance labels, adjusting format)")
+print(f"=" * 80)
